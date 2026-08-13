@@ -274,7 +274,7 @@ func TarFile(src []string, dst []string) (string, error) {
 }
 
 // Applies a gzip compression to a tar file
-func TarToGz(tarFilePath string) (string, error) {
+func TarToGz(tarFilePath string, compressionLevel int) (string, error) {
 
 	// Open the output file for writing in gzip format
 	outFile, err := os.CreateTemp(os.TempDir(), "tar.gz")
@@ -283,7 +283,10 @@ func TarToGz(tarFilePath string) (string, error) {
 	}
 	defer outFile.Close()
 
-	gzipWriter := gzip.NewWriter(outFile)
+	gzipWriter, err := gzip.NewWriterLevel(outFile, compressionLevel)
+	if err != nil {
+		return "", err
+	}
 	defer gzipWriter.Close()
 
 	// Open the tar file
@@ -367,21 +370,12 @@ func DecompressFolder(targzFilePath string, outputDirectory string) error {
 }
 
 func CalculateSha256Digest(outFile io.ReadCloser) string {
-	allbytes := make([]byte, 0)
-	buffer := make([]byte, 500)
-
-	for {
-		n, err := outFile.Read(buffer)
-		allbytes = append(allbytes, buffer[:n]...)
-		if err != nil {
-			break
-		}
-	}
-	if len(allbytes) == 0 {
+	hash := sha256.New()
+	size, err := io.Copy(hash, outFile)
+	if err != nil || size == 0 {
 		return ""
 	}
-	digest := sha256.Sum256(allbytes)
-	return fmt.Sprintf("%x", digest)
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 func CalculateMultiSha256Digest(multifile []string) (string, error) {

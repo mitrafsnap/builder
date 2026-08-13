@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"log"
+	"time"
 
 	"github.com/2DFS/2dfs-builder/cache"
 	compress "github.com/2DFS/2dfs-builder/compress"
@@ -65,6 +66,16 @@ type containerImage struct {
 	manifests      []v1.Manifest
 	configs        []v1.Image
 	cacheLock      sync.Mutex
+	stargzOptions  StargzOptions
+}
+
+type StargzOptions struct {
+	Enabled          bool
+	ChunkSize        int
+	CompressionLevel int
+	GzipLevel        int
+	UseZstd          bool
+	ZstdLevel        int
 }
 
 type CacheKeys struct {
@@ -72,9 +83,11 @@ type CacheKeys struct {
 }
 
 type FileCacheKey struct {
-	Destination   string `json:"destination"`
-	DiffID        string `json:"diffID"`
-	CompressedSha string `json:"compressedSha"`
+	Destination    string `json:"destination"`
+	DiffID         string `json:"diffID"`
+	CompressedSha  string `json:"compressedSha"`
+	TOCDigest      string `json:"tocDigest,omitempty"`
+	CompressedSize int64  `json:"compressedSize,omitempty"`
 }
 
 type partition struct {
@@ -90,12 +103,11 @@ type Image interface {
 	GetExporter(args ...string) (FieldExporter, error)
 }
 
-/*
-Get an image online or from cache.
-forcepull: force image pull even if local cache entry found
-platforms: array of supported platforms. The resulting image will only include support of those is the original image has it.
-*/
 func NewImage(ctx context.Context, url string, forcepull bool, platforms []string) (Image, error) {
+	return NewImageWithStargzOptions(ctx, url, forcepull, platforms, StargzOptions{})
+}
+
+func NewImageWithStargzOptions(ctx context.Context, url string, forcepull bool, platforms []string, stargzOptions StargzOptions) (Image, error) {
 
 	ctxIndexPosition := ctx.Value(IndexStoreContextKey)
 	indexStoreLocation := ""
@@ -142,6 +154,7 @@ func NewImage(ctx context.Context, url string, forcepull bool, platforms []strin
 		configs:        []v1.Image{},
 		platforms:      platforms,
 		cacheLock:      sync.Mutex{},
+		stargzOptions:  stargzOptions,
 	}
 
 	err = img.loadIndex(url, ctx)
@@ -149,6 +162,7 @@ func NewImage(ctx context.Context, url string, forcepull bool, platforms []strin
 		return nil, err
 	}
 
+	downloadStart := time.Now()
 	err = img.downloadManifests()
 	if err != nil {
 		return nil, err
@@ -160,6 +174,7 @@ func NewImage(ctx context.Context, url string, forcepull bool, platforms []strin
 			return nil, err
 		}
 	}
+	log.Printf("Image index retrieved (total download took %s)", time.Since(downloadStart))
 
 	return img, nil
 
@@ -521,8 +536,12 @@ func (c *containerImage) partition() error {
 					return err
 				}
 				fmt.Printf("Partition %s [CREATING]\n", p.Digest)
+				layerMediaType := v1.MediaTypeImageLayerGzip
+				if c.stargzOptions.UseZstd {
+					layerMediaType = v1.MediaTypeImageLayerZstd
+				}
 				filteredLayers = append(filteredLayers, v1.Descriptor{
-					MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+					MediaType: layerMediaType,
 					Digest:    digest.Digest(fmt.Sprintf("sha256:%s", p.Digest)),
 					Size:      blobSize,
 				})
@@ -821,8 +840,13 @@ func (c *containerImage) buildFiled(manifest filesystem.TwoDFsManifest) (filesys
 	return f, nil
 }
 
+// builds allotment tar, gzips it and stores in./2dfs/blobs.
+// The resulting allotment with its digest and position is added to the provided field
 func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesystem.Field) error {
 
+	var tocDigest string
+	var compressedSize int64
+	// digest of all files in src of an allotment
 	fileSha, err := compress.CalculateMultiSha256Digest(a.Src.List)
 	if err != nil {
 		return err
@@ -831,6 +855,7 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	compressedSha, diffID := func() (string, string) {
 		c.cacheLock.Lock()
 		defer c.cacheLock.Unlock()
+		// check uncompressed-keys cache if an entry with fileSha exists
 		keyDigestReader, err := c.keyDigestCache.Get(fileSha)
 		// check if item is cached
 		if err == nil {
@@ -839,14 +864,16 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 			if err != nil {
 				log.Fatal(err)
 			}
-			diffID, compressedSha, err := GetFileSha(cacheKeys, a.Dst.List)
+			cached, err := GetFileSha(cacheKeys, a.Dst.List, c.stargzOptions.Enabled)
 			if err == nil {
 				log.Printf("File %s [CACHED] \n", a.Src)
-				return compressedSha, diffID
-			} else {
-				log.Printf("%v", err)
-				log.Printf("File %s no cache entry found \n", a.Src)
+				tocDigest = cached.TOCDigest
+				compressedSize = cached.CompressedSize
+				return cached.CompressedSha, cached.DiffID
 			}
+
+			log.Printf("%v", err)
+			log.Printf("File %s no cache entry found \n", a.Src)
 		}
 		return "", ""
 	}()
@@ -866,56 +893,114 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 		defer tarReader.Close()
 		defer os.Remove(tarPath)
 
-		diffID = compress.CalculateSha256Digest(tarReader)
-		tarReader.Seek(0, 0)
-
 		log.Printf("File %s [COMPRESSING] \n", a.Src)
 
-		archiveName, err := compress.TarToGz(tarPath)
-		if err != nil {
-			return err
-		}
-		archive, err := os.Open(archiveName)
-		if err != nil {
-			return err
-		}
-		defer archive.Close()
-		defer os.Remove(archiveName)
-		compressedSha = compress.CalculateSha256Digest(archive)
-
-		//add uncompressed allotment cache reference
-		c.cacheLock.Lock()
-		c.upsertCacheKey(fileSha, FileCacheKey{
-			DiffID:        diffID,
-			CompressedSha: compressedSha,
-		}, a.Dst.List)
-		c.cacheLock.Unlock()
-
-		if !c.blobCache.Check(compressedSha) {
-			blobWriter, err := c.blobCache.Add(compressedSha)
+		if c.stargzOptions.Enabled {
+			log.Printf("use stargz compression\n")
+			// Use stargz compression
+			stargzResult, err := compress.TarToStargz(tarPath, c.stargzOptions.ChunkSize, c.stargzOptions.CompressionLevel, c.stargzOptions.UseZstd, c.stargzOptions.ZstdLevel)
 			if err != nil {
 				return err
 			}
-			archive.Seek(0, 0)
-			copyBuffer := make([]byte, 1024*1024*100)
-			_, err = io.CopyBuffer(blobWriter, archive, copyBuffer)
-			blobWriter.Close()
-			archive.Close()
+			defer stargzResult.CompressedBlob.Close()
+
+			// Stream blob directly into cache, computing digest in one pass
+			compressedSha, err = c.blobCache.AddFromReader(stargzResult.CompressedBlob)
 			if err != nil {
-				c.blobCache.Del(compressedSha)
 				return err
 			}
-			log.Printf("Alltoment %d/%d %s [CREATED] \n", a.Row, a.Col, compressedSha)
+			compressedSize, err = c.blobCache.GetSize(compressedSha)
+			if err != nil {
+				return err
+			}
+
+			// DiffID is computed during estargz.Build, available after blob is consumed
+			diffID = stargzResult.CompressedBlob.DiffID().Encoded()
+			log.Printf("diff id %s\n", diffID)
+
+			tocDigest = stargzResult.TOCDigest.String()
+			log.Printf("tocDigest value: '%s'\n", tocDigest)
+
+			//add stargz allotment cache reference
+			c.cacheLock.Lock()
+			c.upsertCacheKey(fileSha, FileCacheKey{
+				DiffID:         diffID,
+				CompressedSha:  compressedSha,
+				TOCDigest:      tocDigest,
+				CompressedSize: compressedSize,
+			}, a.Dst.List)
+			c.cacheLock.Unlock()
+			log.Printf("Stargz Allotment %d/%d %s [CREATED] \n", a.Row, a.Col, compressedSha)
+		} else {
+			// For standard gzip, calculate DiffID from the original tar
+			// (unlike stargz, gzip decompression produces the exact same tar)
+			diffID = compress.CalculateSha256Digest(tarReader)
+			tarReader.Seek(0, 0)
+
+			// Use standard gzip compression
+			archiveName, err := compress.TarToGz(tarPath, c.stargzOptions.GzipLevel)
+			if err != nil {
+				return err
+			}
+			archiveStat, err := os.Stat(archiveName)
+			if err != nil {
+				return err
+			}
+			compressedSize = archiveStat.Size()
+			archive, err := os.Open(archiveName)
+			if err != nil {
+				return err
+			}
+			defer archive.Close()
+			defer os.Remove(archiveName)
+			compressedSha = compress.CalculateSha256Digest(archive)
+
+			//add uncompressed allotment cache reference
+			c.cacheLock.Lock()
+			c.upsertCacheKey(fileSha, FileCacheKey{
+				DiffID:         diffID,
+				CompressedSha:  compressedSha,
+				CompressedSize: compressedSize,
+			}, a.Dst.List)
+			c.cacheLock.Unlock()
+
+			if !c.blobCache.Check(compressedSha) {
+				blobWriter, err := c.blobCache.Add(compressedSha)
+				if err != nil {
+					return err
+				}
+				archive.Seek(0, 0)
+				copyBuffer := make([]byte, 1024*1024)
+				_, err = io.CopyBuffer(blobWriter, archive, copyBuffer)
+				blobWriter.Close()
+				archive.Close()
+				if err != nil {
+					c.blobCache.Del(compressedSha)
+					return err
+				}
+				log.Printf("Alltoment %d/%d %s [CREATED] \n", a.Row, a.Col, compressedSha)
+			}
 		}
 	}
 
-	// add allotments
-	f.AddAllotment(filesystem.Allotment{
-		Row:    a.Row,
-		Col:    a.Col,
-		Digest: compressedSha,
-		DiffID: diffID,
-	})
+	allotment := filesystem.Allotment{
+		Row:            a.Row,
+		Col:            a.Col,
+		Digest:         compressedSha,
+		DiffID:         diffID,
+		CompressedSize: compressedSize,
+	}
+
+	if c.stargzOptions.Enabled {
+		allotment.TOCDigest = tocDigest
+		if c.stargzOptions.UseZstd {
+			allotment.Compression = "zstd"
+		} else {
+			allotment.Compression = "stargz"
+		}
+	}
+
+	f.AddAllotment(allotment)
 
 	return nil
 }
@@ -1051,13 +1136,15 @@ func ParseCacheKey(reader io.Reader) (CacheKeys, error) {
 	return cacheKey, nil
 }
 
-// Given the file destination, and the CacheKeys, looks if any of the keys match the destination and returns the key and the sha of the file. Error otherwise.
-func GetFileSha(keys CacheKeys, dst []string) (string, string, error) {
+// Given the file destination, the CacheKeys, and whether stargz is enabled,
+// looks if any of the keys match the destination and compression type, and returns the key. Error otherwise.
+func GetFileSha(keys CacheKeys, dst []string, stargzEnabled bool) (FileCacheKey, error) {
 	destinationStr := strings.Join(dst, ",")
 	for _, key := range keys.Keys {
-		if key.Destination == destinationStr {
-			return key.DiffID, key.CompressedSha, nil
+		isStargz := key.TOCDigest != ""
+		if key.Destination == destinationStr && isStargz == stargzEnabled {
+			return key, nil
 		}
 	}
-	return "", "", fmt.Errorf("file not found in cache")
+	return FileCacheKey{}, fmt.Errorf("file not found in cache")
 }
