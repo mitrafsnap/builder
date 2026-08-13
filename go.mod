@@ -1,12 +1,12 @@
 module github.com/2DFS/2dfs-builder
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/briandowns/spinner v1.23.1
 	github.com/containerd/stargz-snapshotter/estargz v0.15.1
 	github.com/jedib0t/go-pretty/v6 v6.5.9
-	github.com/klauspost/compress v1.18.3
+	github.com/klauspost/compress v1.18.5
 	github.com/moby/buildkit v0.13.1
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.0
@@ -76,4 +76,4 @@ require (
 	google.golang.org/protobuf v1.33.0 // indirect
 )
 
-replace github.com/containerd/stargz-snapshotter/estargz => github.com/bohdangarchu/stargz-snapshotter/estargz v0.0.0-20260205161008-2bfe7b7274b4
+replace github.com/containerd/stargz-snapshotter/estargz => github.com/mitrafsnap/stargz-snapshotter/estargz v0.0.0-20260813072502-4a59f902a386
