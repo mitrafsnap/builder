@@ -1,3 +1,36 @@
+# MitraFSnap builder
+
+This is the MitraFSnap builder, a fork of the [2DFS builder](https://github.com/2DFS/2dfs-builder).
+Like 2DFS, it packages each model or asset of an image as an independently built and cached
+**allotment**, so an update rebuilds only the allotments it touches. MitraFSnap adds lazy
+loading. The builder can compress every allotment as eStargz or zstd:chunked and generate
+its chunk index during the build, which avoids a separate conversion pass over the image.
+
+## Additions to upstream
+
+`tdfs build` has these new flags.
+
+```
+--enable-stargz               build allotments as eStargz layers with a chunk index
+--use-zstd                    use zstd:chunked instead of gzip
+--stargz-chunk-size N         chunk size in bytes (default 4 MiB)
+--stargz-compression-level N  gzip level for eStargz (1 fastest to 9 smallest)
+--zstd-compression-level N    zstd level (1 fastest to 4 best)
+--compression-level N         gzip level for plain 2DFS allotments
+```
+
+The global `--home-dir` flag, or the `TDFS_HOME` variable, moves the builder's cache. The
+builder also reports compressed allotment sizes, pulls base images that have no index or
+use v1 manifests, and avoids converting a cached allotment twice.
+
+Images built this way are stored and served by the MitraFSnap
+[registry](https://github.com/mitrafsnap/registry) and mounted by the MitraFSnap
+[snapshotter](https://github.com/mitrafsnap/snapshotter).
+
+The upstream README follows.
+
+---
+
 [![Build tdfs CLI](https://github.com/2DFS/2dfs-builder/actions/workflows/build-tdfs.yml/badge.svg?branch=v0.0.102)](https://github.com/2DFS/2dfs-builder/actions/workflows/build-tdfs.yml)
 
 ![tdfs](./img/tdfs.png)
