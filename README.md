@@ -1,166 +1,94 @@
+<p align="center">
+  <a href="https://mitrafsnap.github.io"><img src="https://img.shields.io/badge/Project%20page-mitrafsnap.github.io-cc3333" alt="Project page"></a>
+  <a href="https://github.com/mitrafsnap/demo"><img src="https://img.shields.io/badge/Live%20demo-mitrafsnap%2Fdemo-cc3333" alt="Live demo"></a>
+  <img src="https://img.shields.io/badge/License-Apache--2.0-1c39bb" alt="License Apache-2.0">
+</p>
+
 # MitraFSnap builder
 
-This is the MitraFSnap builder, a fork of the [2DFS builder](https://github.com/2DFS/2dfs-builder).
-Like 2DFS, it packages each model or asset of an image as an independently built and cached
-**allotment**, so an update rebuilds only the allotments it touches. MitraFSnap adds lazy
-loading. The builder can compress every allotment as eStargz or zstd:chunked and generate
-its chunk index during the build, which avoids a separate conversion pass over the image.
+> Part of **MitraFSnap**, Build Less, Pull Less, Restart Never: Fast Container Image
+> Distribution and In-Place Updates. The paper is under review.
+> [Project page, videos and results](https://mitrafsnap.github.io)
 
-## Additions to upstream
+MitraFSnap updates the data mounted in a running container without replacing the container.
+It consists of this builder, a registry and a containerd snapshotter. The builder packages
+each model, configuration or asset of an image as an **allotment** that is built and cached
+independently, so an update rebuilds only the allotments it changes, and independent
+allotments build in parallel.
 
-`tdfs build` has these new flags.
+Every allotment is compressed as eStargz or zstd:chunked, and the builder writes its chunk
+index (TOC) during the build. The image is therefore lazy loadable without a separate
+conversion pass, and the chunk indexes later let the snapshotter tell which bytes of an
+updated allotment actually changed.
 
-```
---enable-stargz               build allotments as eStargz layers with a chunk index
---use-zstd                    use zstd:chunked instead of gzip
---stargz-chunk-size N         chunk size in bytes (default 4 MiB)
---stargz-compression-level N  gzip level for eStargz (1 fastest to 9 smallest)
---zstd-compression-level N    zstd level (1 fastest to 4 best)
---compression-level N         gzip level for plain 2DFS allotments
-```
+| Repository | Role in MitraFSnap |
+|---|---|
+| **builder** (this repository) | builds independent, lazy loadable allotments and their chunk indexes |
+| [registry](https://github.com/mitrafsnap/registry) | turns a partition selection into prefetch hints over the complete image |
+| [snapshotter](https://github.com/mitrafsnap/snapshotter) | lazy pulling and refresh of running containers |
+| [demo](https://github.com/mitrafsnap/demo) | live demo that compares Docker, eStargz, 2DFS and MitraFSnap |
+| [evaluation](https://github.com/mitrafsnap/evaluation) | build, pull and update benchmarks |
 
-The global `--home-dir` flag, or the `TDFS_HOME` variable, moves the builder's cache. The
-builder also reports compressed allotment sizes, pulls base images that have no index or
-use v1 manifests, and avoids converting a cached allotment twice.
+## Build and install
 
-Images built this way are stored and served by the MitraFSnap
-[registry](https://github.com/mitrafsnap/registry) and mounted by the MitraFSnap
-[snapshotter](https://github.com/mitrafsnap/snapshotter).
+The builder is a single Go binary called `tdfs` and needs Go 1.25 or later.
 
-The upstream README follows.
-
----
-
-[![Build tdfs CLI](https://github.com/2DFS/2dfs-builder/actions/workflows/build-tdfs.yml/badge.svg?branch=v0.0.102)](https://github.com/2DFS/2dfs-builder/actions/workflows/build-tdfs.yml)
-
-![tdfs](./img/tdfs.png)
-
-# `tdfs`: a builder 👷‍♀️ for 2DFS images 
-
-This is the command line interface that allows you to build and manage 2DFS images.
-
-## Build and Install `tdfs` cli
-
-Install the binary inside `~/bin/tdfs` (MacOS) or `~/.local/bin/tdfs` (Linux) using:
-
-```
-./install.sh
+```sh
+git clone https://github.com/mitrafsnap/builder.git
+cd builder
+go build -o tdfs ./internal/tdfs.go
+sudo install tdfs /usr/local/bin/
 ```
 
-## Get Started
+## Usage
 
-Navigate to the `examples/simple-2dfs` example directory.
+An image consists of a base OCI image and a field of allotments. `2dfs.json` places each file
+of the build context in a row and a column of the field.
 
-Use `tdfs build ubuntu:22.04 mytdfs:v1` to create your first tdfs image.
-
-![tdfs build](img/build-terminal.png)
-
-## `tdfs --help`
-
-```
-Requires a 2dfs.yaml file in the current directory or a path to a 2dfs.yaml file. Read docs at https://github.com/2DFS/2dfs-builder
-
-Usage:
-  tdfs [command]
-
-Available Commands:
-  build       Build a 2dfs field from an oci image link
-  help        Help about any command
-  image       Commands to manage images
-  version     Print the version number of tdfs
-
-Flags:
-  -h, --help   help for tdfs
-```
-## `tdfs` image push
-
-You can push your tdfs image to an OCI+2DFS compliant registry using the `push` command. 
-
-```
-Usage:
-  tdfs image push [reference] [flags]
+```json
+{
+  "allotments": [
+    { "src": "./detector.onnx", "dst": "/models/detector.onnx", "row": 0, "col": 0 },
+    { "src": "./segmenter.onnx", "dst": "/models/segmenter.onnx", "row": 0, "col": 1 },
+    { "src": "./config.json", "dst": "/models/config.json", "row": 0, "col": 2 }
+  ]
+}
 ```
 
-You can deploy your own OCI+2DFS compliant registry, check out the [2DFS registry repository](https://github.com/2DFS/2dfs-registry) for more information.
+Build the image with lazy loadable allotments and push it to the MitraFSnap registry.
 
-## `tdfs` image export 
-
-
-```
-Usage:
-  tdfs image export [reference] [targetFile] [flags]
-
-Flags:
-      --as string   export format, supported formats: tar
-  -h, --help        help for export
+```sh
+tdfs build --enable-stargz --use-zstd --force-http -f 2dfs.json \
+  ubuntu:24.04 registry.example:5000/app:v1
+tdfs image push --force-http registry.example:5000/app:v1
 ```
 
-You can use this to export a tdfs image a oci image using semantic labeling. 
+When a file changes, the same two commands rebuild and push only its allotment. A client
+selects a partition of the field with a tag suffix `--row1.col1.row2.col2`, which contains every
+allotment with a row between `row1` and `row2` and a column between `col1` and `col2`. For
+example, `app:v1--0.0.0.0` selects only the detector. Several suffixes can be chained, and
+their union is selected.
 
-E.g., 
+| `tdfs build` flag | Meaning |
+|---|---|
+| `--enable-stargz` | build allotments as eStargz layers with a chunk index |
+| `--use-zstd` | use zstd:chunked instead of gzip |
+| `--stargz-chunk-size N` | chunk size in bytes, 4 MiB by default |
+| `--stargz-compression-level N` | gzip level for eStargz, from 1 (fastest) to 9 (smallest) |
+| `--zstd-compression-level N` | zstd level, from 1 (fastest) to 4 (best) |
+| `--compression-level N` | gzip level for allotments without lazy loading |
 
-```
-tdfs image export mytdfs:v1--0.0.1.1 image1.tar.gz
-```
-This will export allotments (0,0),(0,1),(1,0),(1,1) as OCI layers. 
+The global flag `--home-dir`, or the variable `TDFS_HOME`, moves the cache of the builder.
+`tdfs image export` writes a partition as an OCI archive that `docker load` accepts.
 
-```
-tdfs image export mytdfs:v1--0.0.0.0 image0.tar.gz
-```
-This will export only allotment (0,0) as OCI layer. 
+## Relation to the 2DFS builder
 
-## Run `tdfs` images in docker without a registry
+This repository is a fork of the [2DFS builder](https://github.com/2DFS/2dfs-builder), which
+introduced independently built allotments. MitraFSnap adds eStargz and zstd:chunked
+allotments with chunk indexes generated during the build, configurable compression,
+compressed allotment sizes, base images without an index or with v1 manifests, and a
+relocatable cache. The upstream documentation is in [UPSTREAM.md](UPSTREAM.md).
 
-If you exported a partitioned image as tar.gz file, like e.g., `image1.tar.gz`.
-You can import it as a docker image using the docker load command:
+## License
 
-```
-docker load -i image1.tar.gz
-```
-The output should look like this
-```
-docker load -i image1.tar.gz                                                           125 ↵
-Loaded image ID: sha256:0ce9917ccee3aafde0de242f0261120108b54660e26e0956d5c15f5391c25259
-Loaded image ID: sha256:9e4c7ff570e356f784b918bab8c06ec730eb71e471e822d74bb73f4a3687f0b7
-Loaded image ID: sha256:d1af7cb720fabcfefd7ec6cb282060b2a6f152c21da4a3bac50a5a86a0f07a06
-Loaded image ID: sha256:6808b090f05171d053f93611e5061642b86a3a78717de2fcb4d73479a74f0085
-Loaded image ID: sha256:5287804c49232c73a570b4bc3e1cdcad306400db4f36ecea7673dabb1383c5f8
-```
-This command created 5 images, one for each of the supported platform fo the ubuntu:22.04 base image. 
-
-Then try and run this image as usual using the ID corresponding to your platform ID, e.g., 
-
-```
-docker run -it e254bc73d3bcd64864c5fad36aec4b487737ad406ac1175037552c01e570020b /bin/bash 
-```
-
-## Semantic label syntax 
-
-Given the following 3x3 field
-```
-   0  1  2
-    __ __ __
-0  |__|__|__|
-1  |__|__|__|
-2  |__|__|__|
-
-```
-
-The semantic label `image:latest--x1.y1.x2.y2` will generate a partition such that:
-
-**allotment (a) in Field (F) iff := a.row>=x1 & a.row <= x2 & a.col>=y1 & a.col<=y2** 
-
-Smentic labels can be chained, e.g., `image:latest--x1.y1.x2.y2--x11.y11.x22.y22--...`
-and the result will be the union of all partitions. 
-
-## Platform selector
-
-When exporting your image you can select a custom target platform for the partitioned image using the `--platform <os/arc>` flag. 
-
-E.g., 
-```
-tdfs image export mytdfs:v1--0.0.0.0 imageamd64.tar.gz --platform linux/amd64
-```
-
-**N.b. If no platform is specified, the image exported image always includes all the available platforms of the base image**
-
+Apache License 2.0, as upstream. See [LICENSE](LICENSE).
